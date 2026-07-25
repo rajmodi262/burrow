@@ -1,0 +1,4 @@
+/burrow
+/rootfs/
+*.tar
+*.out
