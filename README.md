@@ -1,125 +1,108 @@
 # 🐇 Burrow
 
-**A container runtime in Go, from scratch — build a container, harden it, and watch it work.**
+**A container runtime in Go, from scratch — pull an image, run it, harden it, network it, watch it work.**
 
-Burrow pulls a real **OCI image**, isolates it with **Linux namespaces** and
-**cgroups v2**, layers a **copy-on-write overlayfs** root, gives it its own
-**network** over a veth pair, hardens it with **seccomp** + **capability
-dropping**, supports **rootless** execution via **user namespaces**, and ships a
-**live TUI inspector**. It is a *runc / crun in miniature* — written to
-understand what container runtimes, and platforms like **OpenShift**, actually
-do under the hood, in ~1,000 lines of dependency-light Go.
+Burrow pulls a real **OCI image** from a registry, isolates it with **Linux
+namespaces** and **cgroups v2**, layers a **copy-on-write overlayfs** root,
+gives it **internet access** over a NAT'd veth pair, honours the image's
+**ENTRYPOINT/ENV**, hardens it with **seccomp** + **capability dropping**,
+runs **rootless** via **user namespaces**, and ships `ps`, `images` and a live
+**inspector TUI**. A *runc / crun / podman in miniature* — built to understand
+what container runtimes, and platforms like **OpenShift**, do under the hood,
+in ~1,300 lines of dependency-light Go.
 
-> ⚠️ **Educational, not production.** The goal is a small, readable codebase you
-> can reason about end to end — not a hardened replacement for runc/crun.
+> ⚠️ **Educational, not production.** A small, readable codebase you can reason
+> about end to end — not a hardened runc/crun replacement.
 
 ## Features
 
 | Area | What Burrow does |
 |---|---|
-| **Namespaces** | UTS, PID (command runs as **PID 1**), mount, IPC, and optional network |
-| **cgroups v2** | `--mem 64m` (`memory.max`) and `--cpu 0.5` (`cpu.max`), kernel-enforced |
-| **OCI images** | `--image alpine` pulls from Docker Hub via a **from-scratch registry v2 client** (pure stdlib) |
-| **overlayfs** | copy-on-write root — container writes never touch the base image |
-| **networking** | `--net` → own netns + **veth pair** (host `10.200.1.1` ↔ container `10.200.1.2`) |
-| **seccomp** | `--seccomp` loads a hand-built **classic-BPF** filter that `EPERM`s dangerous syscalls |
-| **capabilities** | `--drop-caps` empties all cap sets + bounding set via raw `capset`/`prctl` |
-| **rootless** | `--userns` maps container uid 0 → your unprivileged host uid (no sudo) |
-| **inspector** | `burrow inspect` → live Bubble Tea TUI of namespaces, cgroup usage, mounts |
-| **correctness** | start-sync pipe (no start races), signal-safe cleanup, stale-cgroup pruning |
+| **Namespaces** | UTS, PID (command is **PID 1**), mount, IPC, optional network + user |
+| **cgroups v2** | `--mem 64m` and `--cpu 0.5`, kernel-enforced |
+| **OCI images** | `--image alpine` — a **from-scratch registry v2 client** (token auth, multi-arch index, gzip layers + whiteouts) |
+| **Image config** | honours the image's **ENTRYPOINT / CMD / ENV / WORKDIR** (`burrow run --image hello-world` just works) |
+| **overlayfs** | copy-on-write root — writes never touch the base image |
+| **Networking** | `--net` → veth + **NAT/MASQUERADE + DNS**: the container reaches the **internet** |
+| **seccomp** | `--seccomp` — a hand-built **classic-BPF** filter `EPERM`s dangerous syscalls |
+| **Capabilities** | `--drop-caps` — empties all sets + bounding set via raw `capset`/`prctl` |
+| **Rootless** | `--userns` — container uid 0 → your unprivileged host uid (no sudo) |
+| **Tooling** | `burrow ps`, `burrow images`, `burrow inspect` (live Bubble Tea TUI) |
+| **Correctness** | start-sync pipe (no start races), signal-safe cleanup, stale-cgroup pruning |
 
 ## Quickstart
 
 ```bash
 make build
 
-# pull and run a real Alpine image
-sudo ./burrow run --image alpine /bin/sh
-
-# resource limits, enforced by the kernel
+sudo ./burrow run --image alpine /bin/sh                 # real Alpine shell
+sudo ./burrow run --image hello-world                    # uses the image ENTRYPOINT
 sudo ./burrow run --image alpine --mem 32m --cpu 0.5 /bin/sh
-
-# its own network namespace + veth pair
-sudo ./burrow run --image alpine --net /bin/sh
-
-# hardened: seccomp filter + zero capabilities
+sudo ./burrow run --image alpine --net /bin/sh           # internet via NAT + DNS
 sudo ./burrow run --image alpine --seccomp --drop-caps /bin/sh
+./burrow run --userns /bin/sh                            # rootless, no sudo
 
-# rootless container (NO sudo): container root == your host user
-./burrow run --userns /bin/sh
-
-# watch a running container live, in another terminal
-sudo ./burrow inspect
+sudo ./burrow ps          # running containers
+./burrow images           # pulled images
+sudo ./burrow inspect     # live TUI of a running container
 ```
 
 > Requires Linux with cgroup v2 (default on modern kernels, incl. **WSL2** 6.x).
-> Everything except `--userns` needs root, so use `sudo`.
+> Everything except `--userns` needs root. Networking needs `iptables`.
 
-## Security demos you can reproduce
+## Demos you can reproduce
 
 ```console
+$ sudo ./burrow run --image alpine --net /bin/sh -c 'wget -qO- http://example.com | grep -o "<title>.*</title>"'
+<title>Example Domain</title>                       # real DNS + HTTP over NAT
+
 $ sudo ./burrow run --image alpine --seccomp /bin/sh -c 'mount -t tmpfs none /mnt'
-mount: permission denied (are you root?)        # seccomp EPERMs the mount(2) syscall
+mount: permission denied                            # seccomp EPERMs mount(2)
 
 $ sudo ./burrow run --image alpine --drop-caps /bin/sh -c 'grep CapEff /proc/self/status; hostname x'
-CapEff: 0000000000000000                        # every capability dropped
-hostname: sethostname: Operation not permitted  # ...so root can't rename the host
+CapEff: 0000000000000000                            # zero capabilities
+hostname: sethostname: Operation not permitted
 
 $ ./burrow run --userns /bin/sh -c 'id; cat /proc/self/uid_map'
-uid=0(root) gid=0(root)                         # root inside...
-         0       1000          1                # ...mapped to host uid 1000 outside
+uid=0(root) gid=0(root)
+         0       1000          1                    # root inside -> host uid 1000
 ```
 
 ## How it works
 
 `burrow run` re-executes its **own binary** as a hidden `child`, launched with
-`CLONE_NEWUTS|NEWPID|NEWNS|NEWIPC` (`+NEWNET` with `--net`, `+NEWUSER` with
-`--userns`). The child sets its hostname, makes `/` private, mounts an
-**overlayfs** and `chroot`s into it, mounts a fresh `/proc`, then **blocks on a
-sync pipe** while the parent writes cgroup limits and moves a veth end into its
-netns. Released, the child drops capabilities, installs the seccomp filter, and
-`syscall.Exec`s the target — which *becomes* PID 1.
+`CLONE_NEWUTS|NEWPID|NEWNS|NEWIPC` (`+NEWNET`/`+NEWUSER` on demand). The child
+sets its hostname, makes `/` private, mounts an **overlayfs** of the image and
+`chroot`s in, mounts `/proc` + `/sys`, then **blocks on a sync pipe** while the
+parent writes cgroup limits and NATs a veth pair into its netns. Released, the
+child applies WORKDIR, drops capabilities, installs the seccomp filter, and
+`syscall.Exec`s the (image ENTRYPOINT or given) command — which becomes PID 1.
 
 ```
 burrow run ─clone(NEWUTS|NEWPID|NEWNS|NEWIPC[|NEWNET][|NEWUSER])─► child
-                       │ sethostname / mount --make-rprivate /
-                       │ mount -t overlay (lower = image rootfs) ; chroot
-                       │ mount -t proc proc /proc
-                       │ ── block on sync pipe (fd 3) ──────────────┐
-   parent: pull image · cgroup memory.max/cpu.max · veth pair ──────┘ (release)
-                       │ drop capabilities (capset) ; install seccomp (BPF)
-                       └ exec(command)  ← PID 1
+                       │ sethostname · mount --make-rprivate /
+                       │ overlayfs(lower=image) · chroot · mount /proc,/sys
+                       │ ── block on sync pipe (fd 3) ───────────────┐
+   parent: pull image+config · cgroup mem/cpu · veth+NAT+DNS ────────┘ release
+                       │ chdir WORKDIR · drop caps (capset) · seccomp (BPF)
+                       └ exec(ENTRYPOINT/cmd)  ← PID 1
 ```
 
 ## Roadmap
 
-- [x] Namespaces (UTS/PID/mount/IPC) + private `/proc`
-- [x] cgroups v2 memory **and** CPU limits
-- [x] Live `/proc` inspector TUI (Bubble Tea + Lipgloss)
-- [x] overlayfs copy-on-write rootfs
-- [x] Network namespace + veth pair
-- [x] **OCI image pull** from a registry (from-scratch v2 client)
-- [x] **seccomp** BPF filtering + **capability dropping**
-- [x] **user namespaces** (rootless) + start-sync pipe
-- [ ] Future — user-supplied seccomp/OCI `config.json` profiles; rootless
-      outbound networking (slirp); image signature verification; cgroup
-      delegation for unprivileged limits
-
-## Known omissions (on purpose)
-
-`/sys` is not mounted; networking has no NAT/outbound path (host↔container
-only); the seccomp blocklist and dropped-caps set are fixed rather than
-policy-driven; no image signature/layer-digest verification. Each is a good
-"what would it take to do this properly?" discussion.
+- [x] Namespaces + cgroups v2 (mem + cpu)
+- [x] Live inspector TUI · overlayfs CoW · veth networking
+- [x] OCI image pull (from-scratch registry client) + image config (entrypoint/env)
+- [x] Container internet via NAT + DNS
+- [x] seccomp (BPF) · capability dropping · user namespaces (rootless)
+- [x] `ps` / `images`, start-sync pipe, signal-safe cleanup
+- [ ] Future — user-supplied seccomp/OCI `config.json` profiles; image signature
+      verification; port publishing; cgroup delegation for unprivileged limits
 
 ## Development
 
 Built and tested on **WSL2** (Ubuntu, kernel 6.6, cgroup v2, Go 1.22+).
-Dependencies: `bubbletea`, `lipgloss`, `golang.org/x/sys`.
-
-```bash
-make vet && make test && make build
-```
+Deps: `bubbletea`, `lipgloss`, `golang.org/x/sys`. `make vet && make test`.
 
 ## License
 

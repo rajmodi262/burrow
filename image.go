@@ -14,10 +14,11 @@ import (
 
 // image.go is a minimal, dependency-free client for the Docker/OCI registry v2
 // HTTP API. It fetches an anonymous pull token, resolves the manifest (handling
-// multi-arch image indexes), downloads each gzipped layer and unpacks them --
-// with OverlayFS-style whiteout handling -- into a local rootfs directory.
+// multi-arch image indexes), downloads each gzipped layer and unpacks them
+// (with OverlayFS-style whiteouts) into a local rootfs, and also stores the
+// image config so `run` can honour the image's ENTRYPOINT/CMD/ENV/WORKDIR.
 //
-// This is what `podman pull` / OpenShift's image machinery do, in ~150 lines.
+// This is what `podman pull` / OpenShift's image machinery do, in ~200 lines.
 
 const registryHost = "https://registry-1.docker.io"
 
@@ -28,19 +29,31 @@ var manifestAccept = strings.Join([]string{
 	"application/vnd.oci.image.index.v1+json",
 }, ", ")
 
+// ImageConfig is the subset of the OCI image config we act on.
+type ImageConfig struct {
+	Env        []string
+	Entrypoint []string
+	Cmd        []string
+	WorkingDir string
+}
+
 func imageCacheRoot() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".burrow", "images")
 }
 
+func cacheDir(name, tag string) string {
+	return filepath.Join(imageCacheRoot(), strings.ReplaceAll(name, "/", "_")+"_"+tag)
+}
+
 // pullImage resolves an image reference (e.g. "alpine", "library/nginx:1.27"),
-// pulls its layers, unpacks them into a cached rootfs and returns that path.
+// pulls its layers + config into a cache, and returns the rootfs path.
 func pullImage(ref string) (string, error) {
 	name, tag := parseRef(ref)
-	cache := filepath.Join(imageCacheRoot(), strings.ReplaceAll(name, "/", "_")+"_"+tag)
+	cache := cacheDir(name, tag)
 	rootfs := filepath.Join(cache, "rootfs")
 	if _, err := os.Stat(filepath.Join(cache, ".done")); err == nil {
-		return rootfs, nil // already pulled
+		return rootfs, nil
 	}
 	fmt.Fprintf(os.Stderr, "burrow: pulling %s:%s ...\n", name, tag)
 
@@ -48,7 +61,7 @@ func pullImage(ref string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	layers, err := getLayers(name, tag, token)
+	configDigest, layers, err := getManifestSpec(name, tag, token)
 	if err != nil {
 		return "", err
 	}
@@ -67,10 +80,42 @@ func pullImage(ref string) (string, error) {
 			return "", fmt.Errorf("extract layer %d: %w", i+1, err)
 		}
 	}
+	if configDigest != "" { // save image config for run-time defaults
+		if blob, err := getBlob(name, configDigest, token); err == nil {
+			raw, _ := io.ReadAll(blob)
+			blob.Close()
+			os.WriteFile(filepath.Join(cache, "config.json"), raw, 0o644)
+		}
+	}
+	os.WriteFile(filepath.Join(cache, "ref"), []byte(name+":"+tag+"\n"), 0o644)
 	if err := os.WriteFile(filepath.Join(cache, ".done"), []byte("ok\n"), 0o644); err != nil {
 		return "", err
 	}
 	return rootfs, nil
+}
+
+// loadImageConfig returns the cached image's ENTRYPOINT/CMD/ENV/WORKDIR.
+func loadImageConfig(ref string) (ImageConfig, error) {
+	name, tag := parseRef(ref)
+	raw, err := os.ReadFile(filepath.Join(cacheDir(name, tag), "config.json"))
+	if err != nil {
+		return ImageConfig{}, err
+	}
+	var rc struct {
+		Config struct {
+			Env        []string `json:"Env"`
+			Entrypoint []string `json:"Entrypoint"`
+			Cmd        []string `json:"Cmd"`
+			WorkingDir string   `json:"WorkingDir"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &rc); err != nil {
+		return ImageConfig{}, err
+	}
+	return ImageConfig{
+		Env: rc.Config.Env, Entrypoint: rc.Config.Entrypoint,
+		Cmd: rc.Config.Cmd, WorkingDir: rc.Config.WorkingDir,
+	}, nil
 }
 
 func pullCmd(args []string) {
@@ -92,7 +137,7 @@ func parseRef(ref string) (name, tag string) {
 		tag, ref = ref[i+1:], ref[:i]
 	}
 	if !strings.Contains(ref, "/") {
-		ref = "library/" + ref // official images live under library/
+		ref = "library/" + ref
 	}
 	return ref, tag
 }
@@ -132,12 +177,12 @@ func getManifestRaw(name, ref, token string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// getLayers returns the ordered layer digests, following an image index to the
-// linux/amd64 manifest when necessary.
-func getLayers(name, tag, token string) ([]string, error) {
+// getManifestSpec returns the config digest and ordered layer digests,
+// following an image index to the linux/amd64 manifest when necessary.
+func getManifestSpec(name, tag, token string) (config string, layers []string, err error) {
 	raw, err := getManifestRaw(name, tag, token)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	var m struct {
 		Manifests []struct {
@@ -147,14 +192,17 @@ func getLayers(name, tag, token string) ([]string, error) {
 				OS           string `json:"os"`
 			} `json:"platform"`
 		} `json:"manifests"`
+		Config struct {
+			Digest string `json:"digest"`
+		} `json:"config"`
 		Layers []struct {
 			Digest string `json:"digest"`
 		} `json:"layers"`
 	}
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	if len(m.Manifests) > 0 { // multi-arch index: pick linux/amd64
+	if len(m.Manifests) > 0 { // multi-arch index -> pick linux/amd64
 		digest := ""
 		for _, e := range m.Manifests {
 			if e.Platform.Architecture == "amd64" && e.Platform.OS == "linux" {
@@ -163,24 +211,23 @@ func getLayers(name, tag, token string) ([]string, error) {
 			}
 		}
 		if digest == "" {
-			return nil, fmt.Errorf("no linux/amd64 manifest in index")
+			return "", nil, fmt.Errorf("no linux/amd64 manifest in index")
 		}
 		if raw, err = getManifestRaw(name, digest, token); err != nil {
-			return nil, err
+			return "", nil, err
 		}
-		m.Layers = nil
+		m.Layers, m.Config.Digest = nil, ""
 		if err := json.Unmarshal(raw, &m); err != nil {
-			return nil, err
+			return "", nil, err
 		}
 	}
-	var out []string
 	for _, l := range m.Layers {
-		out = append(out, l.Digest)
+		layers = append(layers, l.Digest)
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("manifest has no layers")
+	if len(layers) == 0 {
+		return "", nil, fmt.Errorf("manifest has no layers")
 	}
-	return out, nil
+	return m.Config.Digest, layers, nil
 }
 
 func getBlob(name, digest, token string) (io.ReadCloser, error) {
@@ -216,7 +263,7 @@ func extractLayer(r io.Reader, dest string) error {
 		}
 		name := filepath.Clean(hdr.Name)
 		if name == "." || strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
-			continue // ignore unsafe paths
+			continue
 		}
 		target := filepath.Join(dest, name)
 		dir, base := filepath.Dir(target), filepath.Base(name)

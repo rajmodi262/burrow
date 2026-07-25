@@ -26,7 +26,7 @@ import (
 	"syscall"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -42,6 +42,10 @@ func main() {
 		inspect(os.Args[2:])
 	case "pull":
 		pullCmd(os.Args[2:])
+	case "ps":
+		psCmd(os.Args[2:])
+	case "images":
+		imagesCmd(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("burrow", version)
 	default:
@@ -58,14 +62,17 @@ usage:
     flags: --mem 64m  --cpu 0.5  --net  --image NAME|--rootfs DIR
            --drop-caps  --seccomp  --userns
   sudo burrow pull <image>               pull an OCI image into a local rootfs
+  sudo burrow ps                         list running containers
+  burrow images                          list pulled images
   sudo burrow inspect [--once] [PID]     live view of a running container
   burrow version`)
 }
 
 type runOpts struct {
-	mem, cpu, rootfs, image        string
-	net, dropCaps, seccomp, userns bool
-	cmd                            []string
+	mem, cpu, rootfs, image, workdir string
+	net, dropCaps, seccomp, userns   bool
+	env                              []string
+	cmd                              []string
 }
 
 func parseRunArgs(args []string) runOpts {
@@ -115,10 +122,6 @@ func parseRunArgs(args []string) runOpts {
 // veth network pair, and cleans everything up -- even on Ctrl-C.
 func run(args []string) {
 	o := parseRunArgs(args)
-	if len(o.cmd) == 0 {
-		usage()
-		os.Exit(2)
-	}
 	pruneStaleCgroups()
 
 	if o.image != "" {
@@ -128,6 +131,16 @@ func run(args []string) {
 			os.Exit(1)
 		}
 		o.rootfs = rf
+		if cfg, err := loadImageConfig(o.image); err == nil {
+			o.env, o.workdir = cfg.Env, cfg.WorkingDir
+			if len(o.cmd) == 0 { // fall back to the image's ENTRYPOINT + CMD
+				o.cmd = append(append([]string{}, cfg.Entrypoint...), cfg.Cmd...)
+			}
+		}
+	}
+	if len(o.cmd) == 0 {
+		usage()
+		os.Exit(2)
 	}
 
 	childArgs := []string{"child"}
@@ -139,6 +152,9 @@ func run(args []string) {
 	}
 	if o.seccomp {
 		childArgs = append(childArgs, "--seccomp")
+	}
+	if o.workdir != "" {
+		childArgs = append(childArgs, "--workdir", o.workdir)
 	}
 	childArgs = append(childArgs, o.cmd...)
 
@@ -154,6 +170,9 @@ func run(args []string) {
 		os.Exit(1)
 	}
 	cmd.ExtraFiles = []*os.File{syncR}
+	if len(o.env) > 0 {
+		cmd.Env = o.env
+	}
 
 	var flags uintptr = syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID |
 		syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC
@@ -237,7 +256,7 @@ func run(args []string) {
 // namespace private, optionally chroots into a rootfs, mounts a fresh /proc,
 // and finally becomes (execs) the target command -- PID 1 of the container.
 func child(args []string) {
-	var rootfs string
+	var rootfs, workdir string
 	dropCaps, seccomp := false, false
 	i := 0
 childflags:
@@ -255,6 +274,12 @@ childflags:
 		case "--seccomp":
 			seccomp = true
 			i++
+		case "--workdir":
+			i++
+			if i < len(args) {
+				workdir = args[i]
+				i++
+			}
 		default:
 			break childflags
 		}
@@ -277,16 +302,25 @@ childflags:
 		}
 		must("chroot", syscall.Chroot(target))
 		must("chdir", syscall.Chdir("/"))
+		// Give the container working DNS (only inside its own rootfs).
+		_ = os.MkdirAll("/etc", 0o755)
+		_ = os.WriteFile("/etc/resolv.conf", []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
 	}
 
 	_ = os.MkdirAll("/proc", 0o555)
 	must("mount-proc", syscall.Mount("proc", "/proc", "proc", 0, ""))
+	_ = os.MkdirAll("/sys", 0o555)
+	_ = syscall.Mount("sysfs", "/sys", "sysfs", syscall.MS_RDONLY, "") // best effort
 
 	// Wait for the parent to finish cgroup + network setup.
 	if f := os.NewFile(3, "sync"); f != nil {
 		var one [1]byte
 		_, _ = f.Read(one[:])
 		f.Close()
+	}
+
+	if workdir != "" {
+		_ = os.Chdir(workdir)
 	}
 
 	// Apply hardening last -- after our own privileged setup (mount, chroot).
