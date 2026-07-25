@@ -12,7 +12,6 @@
 ![Go](https://img.shields.io/badge/Go-1.22%2B-00ADD8?style=for-the-badge&logo=go&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-namespaces%20%C2%B7%20cgroups%20%C2%B7%20seccomp-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ![OCI](https://img.shields.io/badge/OCI-image%20pull-2496ED?style=for-the-badge&logo=docker&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-3DA639?style=for-the-badge)
 
 [![CI](https://github.com/rajmodi262/burrow/actions/workflows/ci.yml/badge.svg)](https://github.com/rajmodi262/burrow/actions/workflows/ci.yml)
 ![Made with](https://img.shields.io/badge/made%20with-curiosity-ff69b4)
@@ -333,14 +332,14 @@ to do this properly?"* question.
 ## 🙏 Inspiration
 
 Standing on the shoulders of the tools this was built to understand — **[runc](https://github.com/opencontainers/runc)**,
-Red Hat's **[crun](https://github.com/containers/crun)** and **[Podman](https://github.com/containers/podman)**,
+**[crun](https://github.com/containers/crun)** and **[Podman](https://github.com/containers/podman)**,
 and Liz Rice's *"Containers from Scratch"* talks.
 
 ---
 
 <div align="center">
 
-**Built by [Raj Modi](https://github.com/rajmodi262)** · MIT Licensed · Made to understand, not to ship.
+**Built by [Raj Modi](https://github.com/rajmodi262)** · Made to understand, not to ship.
 
 <sub>🐇 A container is just a process that believes it's alone.</sub>
 
