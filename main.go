@@ -1,26 +1,32 @@
 // Burrow is a minimal, educational container runtime written in Go.
 //
-// It isolates a process using Linux namespaces (UTS, PID, mount) and a
-// cgroups v2 memory limit, then optionally pivots into its own root
-// filesystem -- demonstrating what real runtimes such as runc / crun
-// (and therefore OpenShift) do under the hood.
+// It isolates a process using Linux namespaces (UTS, PID, mount, IPC and
+// optionally network) and cgroups v2 (memory + CPU limits), then optionally
+// pivots into its own root filesystem. A companion `inspect` command renders a
+// live view of a running container's namespaces, cgroup usage and mounts.
+//
+// It exists to show what real runtimes such as runc / crun -- and therefore
+// platforms like OpenShift -- do under the hood.
 //
 // Usage:
 //
-//	sudo burrow run [--mem 64m] [--rootfs ./rootfs] <command> [args...]
+//	sudo burrow run [--mem 64m] [--cpu 0.5] [--net] [--rootfs DIR] <cmd> [args...]
+//	sudo burrow inspect [--once] [PID]
+//	burrow version
 //
 // NOT for production: no seccomp, no capability dropping, no user-namespace
-// mapping. It is a learning tool, on purpose kept small and readable.
+// mapping. It is a learning tool, deliberately kept small and readable.
 package main
 
 import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"syscall"
 )
 
-const version = "0.1.0"
+const version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -32,6 +38,8 @@ func main() {
 		run(os.Args[2:])
 	case "child": // internal: re-executed inside the new namespaces
 		child(os.Args[2:])
+	case "inspect":
+		inspect(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("burrow", version)
 	default:
@@ -41,13 +49,18 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: sudo burrow run [--mem 64m] [--rootfs DIR] <command> [args...]")
+	fmt.Fprintln(os.Stderr, `burrow - a minimal, educational container runtime
+
+usage:
+  sudo burrow run [--mem 64m] [--cpu 0.5] [--net] [--rootfs DIR] <cmd> [args...]
+  sudo burrow inspect [--once] [PID]     live view of a running container
+  burrow version`)
 }
 
 type runOpts struct {
-	mem    string
-	rootfs string
-	cmd    []string
+	mem, cpu, rootfs string
+	net              bool
+	cmd              []string
 }
 
 func parseRunArgs(args []string) runOpts {
@@ -60,11 +73,18 @@ func parseRunArgs(args []string) runOpts {
 			if i < len(args) {
 				o.mem = args[i]
 			}
+		case "--cpu":
+			i++
+			if i < len(args) {
+				o.cpu = args[i]
+			}
 		case "--rootfs":
 			i++
 			if i < len(args) {
 				o.rootfs = args[i]
 			}
+		case "--net":
+			o.net = true
 		default:
 			o.cmd = args[i:]
 			return o
@@ -74,14 +94,16 @@ func parseRunArgs(args []string) runOpts {
 	return o
 }
 
-// run re-executes this same binary as "child" inside a fresh set of
-// namespaces, then (best effort) caps the child's memory with cgroups v2.
+// run launches the target command inside fresh namespaces, wires up a cgroup
+// (always, for tracking + optional limits + inspection), optionally sets up a
+// veth network pair, and cleans everything up -- even on Ctrl-C.
 func run(args []string) {
 	o := parseRunArgs(args)
 	if len(o.cmd) == 0 {
 		usage()
 		os.Exit(2)
 	}
+	pruneStaleCgroups()
 
 	childArgs := []string{"child"}
 	if o.rootfs != "" {
@@ -91,10 +113,14 @@ func run(args []string) {
 
 	cmd := exec.Command("/proc/self/exe", childArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+
+	var flags uintptr = syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID |
+		syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC
+	if o.net {
+		flags |= syscall.CLONE_NEWNET
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		// New UTS (hostname), PID (own process tree) and mount namespaces.
-		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
-		// Keep our mounts from leaking back to the host.
+		Cloneflags:   flags,
 		Unshareflags: syscall.CLONE_NEWNS,
 	}
 
@@ -102,21 +128,63 @@ func run(args []string) {
 		fmt.Fprintln(os.Stderr, "burrow: start:", err)
 		os.Exit(1)
 	}
+	pid := cmd.Process.Pid
 
-	if o.mem != "" {
-		if err := applyMemoryLimit(cmd.Process.Pid, o.mem); err != nil {
-			fmt.Fprintln(os.Stderr, "burrow: warning: memory limit not applied:", err)
+	cg, err := newCgroup(pid)
+	if err != nil {
+		warn("cgroup", err)
+	}
+	if cg != nil {
+		if o.mem != "" {
+			if e := cg.setMemoryMax(o.mem); e != nil {
+				warn("memory limit", e)
+			}
+		}
+		if o.cpu != "" {
+			if e := cg.setCPUMax(o.cpu); e != nil {
+				warn("cpu limit", e)
+			}
+		}
+		if e := cg.addProc(pid); e != nil {
+			warn("attach pid", e)
 		}
 	}
 
-	if err := cmd.Wait(); err != nil {
+	var netObj *veth
+	if o.net {
+		netObj = newVeth(pid)
+		if e := netObj.setup(); e != nil {
+			warn("network", e)
+		}
+	}
+
+	// Forward Ctrl-C / SIGTERM to the container so our deferred cleanup
+	// (cgroup removal, veth teardown) always runs.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		_ = cmd.Process.Signal(syscall.SIGKILL)
+	}()
+
+	waitErr := cmd.Wait()
+
+	// Explicit cleanup so it runs on every exit path -- normal exit AND
+	// Ctrl-C / SIGTERM (os.Exit would skip deferred cleanup).
+	if cg != nil {
+		_ = cg.remove()
+	}
+	if netObj != nil {
+		netObj.teardown()
+	}
+	if waitErr != nil {
 		os.Exit(1)
 	}
 }
 
-// child runs inside the new namespaces. It sets the hostname, makes the
-// mount namespace private, optionally chroots into a rootfs, mounts a fresh
-// /proc, and finally *becomes* the target command (PID 1 of the container).
+// child runs inside the new namespaces: it sets the hostname, makes the mount
+// namespace private, optionally chroots into a rootfs, mounts a fresh /proc,
+// and finally becomes (execs) the target command -- PID 1 of the container.
 func child(args []string) {
 	rootfs := ""
 	if len(args) >= 2 && args[0] == "--rootfs" {
@@ -128,11 +196,16 @@ func child(args []string) {
 	}
 
 	must("sethostname", syscall.Sethostname([]byte("burrow")))
-	// Make "/" private (recursively) so mounts below don't propagate out.
 	must("mount-private", syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""))
 
 	if rootfs != "" {
-		must("chroot", syscall.Chroot(rootfs))
+		target := rootfs
+		if merged, err := mountOverlay(rootfs); err == nil {
+			target = merged // copy-on-write: writes go to the overlay upper layer
+		} else {
+			fmt.Fprintln(os.Stderr, "burrow child: overlay unavailable, using rootfs directly:", err)
+		}
+		must("chroot", syscall.Chroot(target))
 		must("chdir", syscall.Chdir("/"))
 	}
 
@@ -144,8 +217,6 @@ func child(args []string) {
 		fmt.Fprintln(os.Stderr, "burrow child: command not found:", args[0])
 		os.Exit(127)
 	}
-	// Replace this process image, so the command becomes PID 1 in the
-	// container -- exactly how an init process behaves in a real container.
 	must("exec", syscall.Exec(path, args, os.Environ()))
 }
 
@@ -154,4 +225,8 @@ func must(what string, err error) {
 		fmt.Fprintf(os.Stderr, "burrow child: %s: %v\n", what, err)
 		os.Exit(1)
 	}
+}
+
+func warn(what string, err error) {
+	fmt.Fprintf(os.Stderr, "burrow: warning: %s: %v\n", what, err)
 }

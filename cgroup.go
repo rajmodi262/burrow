@@ -10,28 +10,42 @@ import (
 
 const cgroupRoot = "/sys/fs/cgroup"
 
-// applyMemoryLimit creates a cgroups v2 group, writes memory.max, and moves
-// the given pid into it. Requires a cgroup v2 unified hierarchy (the default
-// on modern Linux, incl. WSL2 kernel 6.x).
-func applyMemoryLimit(pid int, mem string) error {
-	bytes, err := parseMemory(mem)
+// cgroup is a single cgroups v2 group living at cgroupRoot/burrow.<pid>.
+type cgroup struct{ dir string }
+
+func newCgroup(pid int) (*cgroup, error) {
+	dir := filepath.Join(cgroupRoot, fmt.Sprintf("burrow.%d", pid))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create cgroup: %w", err)
+	}
+	return &cgroup{dir: dir}, nil
+}
+
+func (c *cgroup) write(file, val string) error {
+	return os.WriteFile(filepath.Join(c.dir, file), []byte(val), 0o644)
+}
+
+func (c *cgroup) setMemoryMax(mem string) error {
+	b, err := parseMemory(mem)
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(cgroupRoot, fmt.Sprintf("burrow.%d", pid))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create cgroup: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "memory.max"),
-		[]byte(strconv.FormatInt(bytes, 10)), 0o644); err != nil {
-		return fmt.Errorf("set memory.max: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"),
-		[]byte(strconv.Itoa(pid)), 0o644); err != nil {
-		return fmt.Errorf("attach pid: %w", err)
-	}
-	return nil
+	return c.write("memory.max", strconv.FormatInt(b, 10))
 }
+
+func (c *cgroup) setCPUMax(cpus string) error {
+	quota, err := parseCPU(cpus)
+	if err != nil {
+		return err
+	}
+	return c.write("cpu.max", quota)
+}
+
+func (c *cgroup) addProc(pid int) error {
+	return c.write("cgroup.procs", strconv.Itoa(pid))
+}
+
+func (c *cgroup) remove() error { return os.Remove(c.dir) }
 
 // parseMemory converts "64m", "1g", "512k" or a raw byte count into bytes.
 func parseMemory(s string) (int64, error) {
@@ -53,4 +67,16 @@ func parseMemory(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid memory value %q", s)
 	}
 	return n * mult, nil
+}
+
+// parseCPU turns a fractional core count ("0.5", "1", "2") into a cgroup v2
+// cpu.max string: "<quota_us> <period_us>" over a 100ms period.
+func parseCPU(s string) (string, error) {
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || f <= 0 {
+		return "", fmt.Errorf("invalid cpu value %q", s)
+	}
+	const period = 100000
+	quota := int64(f * float64(period))
+	return fmt.Sprintf("%d %d", quota, period), nil
 }
