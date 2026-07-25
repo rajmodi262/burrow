@@ -26,7 +26,7 @@ import (
 	"syscall"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -40,6 +40,8 @@ func main() {
 		child(os.Args[2:])
 	case "inspect":
 		inspect(os.Args[2:])
+	case "pull":
+		pullCmd(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("burrow", version)
 	default:
@@ -52,15 +54,18 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `burrow - a minimal, educational container runtime
 
 usage:
-  sudo burrow run [--mem 64m] [--cpu 0.5] [--net] [--rootfs DIR] <cmd> [args...]
+  sudo burrow run [flags] <cmd> [args...]
+    flags: --mem 64m  --cpu 0.5  --net  --image NAME|--rootfs DIR
+           --drop-caps  --seccomp  --userns
+  sudo burrow pull <image>               pull an OCI image into a local rootfs
   sudo burrow inspect [--once] [PID]     live view of a running container
   burrow version`)
 }
 
 type runOpts struct {
-	mem, cpu, rootfs string
-	net              bool
-	cmd              []string
+	mem, cpu, rootfs, image        string
+	net, dropCaps, seccomp, userns bool
+	cmd                            []string
 }
 
 func parseRunArgs(args []string) runOpts {
@@ -83,8 +88,19 @@ func parseRunArgs(args []string) runOpts {
 			if i < len(args) {
 				o.rootfs = args[i]
 			}
+		case "--image":
+			i++
+			if i < len(args) {
+				o.image = args[i]
+			}
 		case "--net":
 			o.net = true
+		case "--drop-caps":
+			o.dropCaps = true
+		case "--seccomp":
+			o.seccomp = true
+		case "--userns":
+			o.userns = true
 		default:
 			o.cmd = args[i:]
 			return o
@@ -105,14 +121,39 @@ func run(args []string) {
 	}
 	pruneStaleCgroups()
 
+	if o.image != "" {
+		rf, err := pullImage(o.image)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "burrow: pull:", err)
+			os.Exit(1)
+		}
+		o.rootfs = rf
+	}
+
 	childArgs := []string{"child"}
 	if o.rootfs != "" {
 		childArgs = append(childArgs, "--rootfs", o.rootfs)
+	}
+	if o.dropCaps {
+		childArgs = append(childArgs, "--drop-caps")
+	}
+	if o.seccomp {
+		childArgs = append(childArgs, "--seccomp")
 	}
 	childArgs = append(childArgs, o.cmd...)
 
 	cmd := exec.Command("/proc/self/exe", childArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+
+	// Start-sync pipe: the child sets up its namespaces then blocks on fd 3
+	// until we finish cgroup + network wiring, so nothing races the container
+	// start (this is how runc/crun avoid the same race).
+	syncR, syncW, perr := os.Pipe()
+	if perr != nil {
+		fmt.Fprintln(os.Stderr, "burrow: pipe:", perr)
+		os.Exit(1)
+	}
+	cmd.ExtraFiles = []*os.File{syncR}
 
 	var flags uintptr = syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID |
 		syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC
@@ -123,12 +164,18 @@ func run(args []string) {
 		Cloneflags:   flags,
 		Unshareflags: syscall.CLONE_NEWNS,
 	}
+	if o.userns {
+		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWUSER
+		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}}
+		cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}}
+	}
 
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "burrow: start:", err)
 		os.Exit(1)
 	}
 	pid := cmd.Process.Pid
+	syncR.Close()
 
 	cg, err := newCgroup(pid)
 	if err != nil {
@@ -158,6 +205,10 @@ func run(args []string) {
 		}
 	}
 
+	// Everything is wired -- let the container's command actually start.
+	_, _ = syncW.Write([]byte{1})
+	syncW.Close()
+
 	// Forward Ctrl-C / SIGTERM to the container so our deferred cleanup
 	// (cgroup removal, veth teardown) always runs.
 	sigs := make(chan os.Signal, 1)
@@ -186,10 +237,29 @@ func run(args []string) {
 // namespace private, optionally chroots into a rootfs, mounts a fresh /proc,
 // and finally becomes (execs) the target command -- PID 1 of the container.
 func child(args []string) {
-	rootfs := ""
-	if len(args) >= 2 && args[0] == "--rootfs" {
-		rootfs, args = args[1], args[2:]
+	var rootfs string
+	dropCaps, seccomp := false, false
+	i := 0
+childflags:
+	for i < len(args) {
+		switch args[i] {
+		case "--rootfs":
+			i++
+			if i < len(args) {
+				rootfs = args[i]
+				i++
+			}
+		case "--drop-caps":
+			dropCaps = true
+			i++
+		case "--seccomp":
+			seccomp = true
+			i++
+		default:
+			break childflags
+		}
 	}
+	args = args[i:]
 	if len(args) == 0 {
 		usage()
 		os.Exit(2)
@@ -211,6 +281,21 @@ func child(args []string) {
 
 	_ = os.MkdirAll("/proc", 0o555)
 	must("mount-proc", syscall.Mount("proc", "/proc", "proc", 0, ""))
+
+	// Wait for the parent to finish cgroup + network setup.
+	if f := os.NewFile(3, "sync"); f != nil {
+		var one [1]byte
+		_, _ = f.Read(one[:])
+		f.Close()
+	}
+
+	// Apply hardening last -- after our own privileged setup (mount, chroot).
+	if dropCaps {
+		must("drop-caps", dropCapabilities())
+	}
+	if seccomp {
+		must("seccomp", installSeccomp())
+	}
 
 	path, err := exec.LookPath(args[0])
 	if err != nil {
